@@ -1083,9 +1083,9 @@ function export_pti(io::IO, data::Dict{String,Any})
     # Bus
     for (_, bus) in sort(collect(data["bus"]), by=(x) -> x.second["index"])
         # Skip star-buses created by three-winding transformers from importing raw source files
-        if bus["source_id"][1] == "transformer"
-            continue
-        end
+        # if bus["source_id"][1] == "transformer"
+        #    continue
+        # end      # added by Henrik, copying over for now.
 
         # Get Dict in a PSSE way
         psse_comp = _pm2psse_bus(bus)
