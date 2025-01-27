@@ -489,11 +489,16 @@ function _make_mixed_units!(data::Dict{String,<:Any})
         _apply_func!(branch, "shift", rad2deg)
         _apply_func!(branch, "angmax", rad2deg)
         _apply_func!(branch, "angmin", rad2deg)
+        _apply_func!(branch, "vad", rad2deg)   # added by Henrik, copying over for now.
 
         _apply_func!(branch, "pf", rescale)
         _apply_func!(branch, "pt", rescale)
         _apply_func!(branch, "qf", rescale)
         _apply_func!(branch, "qt", rescale)
+ 
+        _apply_func!(branch, "St", rescale)       # added by Henrik, copying over for now.
+        _apply_func!(branch, "Sf", rescale)       # added by Henrik, copying over for now.
+        _apply_func!(branch, "S_rate", rescale)   # added by Henrik, copying over for now.
 
         _apply_func!(branch, "mu_sm_fr", rescale_dual)
         _apply_func!(branch, "mu_sm_to", rescale_dual)
@@ -765,16 +770,26 @@ function _calc_branch_flow_ac(data::Dict{String,<:Any})
 
             tm = branch["tap"]
 
+            rate = sqrt(3) * branch["c_rating_a"] * branch["base_kv"]*1e3 / data["baseMVA"] # rating in p.u., not MVA   # added by Henrik, copying over for now.
+
             vm_fr = vm[f_bus]
             vm_to = vm[t_bus]
             va_fr = va[f_bus]
             va_to = va[t_bus]
+
+            # voltage angle difference between from and to buses, this way we can check in the results dict under results_branches what the angle diff is
+            va_diff = va_fr - va_to     # added by Henrik, copying over for now.
 
             p_fr =  (g+g_fr)/tm^2*vm_fr^2 + (-g*tr+b*ti)/tm^2*(vm_fr*vm_to*cos(va_fr-va_to)) + (-b*tr-g*ti)/tm^2*(vm_fr*vm_to*sin(va_fr-va_to))
             q_fr = -(b+b_fr)/tm^2*vm_fr^2 - (-b*tr-g*ti)/tm^2*(vm_fr*vm_to*cos(va_fr-va_to)) + (-g*tr+b*ti)/tm^2*(vm_fr*vm_to*sin(va_fr-va_to))
 
             p_to =  (g+g_to)*vm_to^2 + (-g*tr-b*ti)/tm^2*(vm_to*vm_fr*cos(va_to-va_fr)) + (-b*tr+g*ti)/tm^2*(vm_to*vm_fr*sin(va_to-va_fr))
             q_to = -(b+b_to)*vm_to^2 - (-b*tr+g*ti)/tm^2*(vm_to*vm_fr*cos(va_to-va_fr)) + (-g*tr-b*ti)/tm^2*(vm_to*vm_fr*sin(va_to-va_fr))
+            
+            S_to = sqrt(p_to^2 + q_to^2)   # added by Henrik, copying over for now.
+            S_fr = sqrt(p_fr^2 + q_fr^2)   # added by Henrik, copying over for now.
+
+            loading = max(S_to, S_fr)/rate  # added by Henrik, copying over for now.
         else
             p_fr = NaN
             q_fr = NaN
@@ -787,7 +802,12 @@ function _calc_branch_flow_ac(data::Dict{String,<:Any})
             "pf" => p_fr,
             "qf" => q_fr,
             "pt" => p_to,
-            "qt" => q_to
+            "qt" => q_to,
+            "St"  => S_to, # added by Henrik, copying over for now.
+            "Sf"  => S_fr, # added by Henrik, copying over for now.
+            "S_rate" => rate, # added by Henrik, copying over for now.
+            "loading" => loading, # added by Henrik, copying over for now.
+            "vad" => va_diff # added by Henrik, copying over for now.
         )
     end
 
