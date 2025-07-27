@@ -1100,7 +1100,7 @@ function calc_thermal_limits!(data::Dict{String,<:Any})
 end
 
 
-function _calc_thermal_limits!(pm_data::Dict{String,<:Any})
+function _calc_thermal_limits!(pm_data::Dict{String,<:Any}; warn=true)
     mva_base = pm_data["baseMVA"]
 
     branches = [branch for branch in values(pm_data["branch"])]
@@ -1134,8 +1134,9 @@ function _calc_thermal_limits!(pm_data::Dict{String,<:Any})
             if haskey(branch, "c_rating_a") && branch["c_rating_a"] > 0.0
                 new_rate = min(new_rate, branch["c_rating_a"]*m_vmax)
             end
-
-            Memento.warn(_LOGGER, "this code only supports positive rate_a values, changing the value on branch $(branch["index"]) to $(round(mva_base*new_rate, digits=4))")
+            if warn
+                Memento.warn(_LOGGER, "this code only supports positive rate_a values, changing the value on branch $(branch["index"]) to $(round(mva_base*new_rate, digits=4))")
+            end
             branch["rate_a"] = new_rate
         end
     end
