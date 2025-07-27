@@ -1,29 +1,32 @@
 """
-    parse_file(file; import_all)
+    parse_file(io::String; import_all=false, validate=true)
+    parse_file(io::IO; import_all=false, validate=true, filetype="json")
 
-Parses a Matpower .m `file` or PTI (PSS(R)E-v33) .raw `file` into a
-PowerModels data structure. All fields from PTI files will be imported if
-`import_all` is true (Default: false).
+Parse a file into a PowerModels data structure.
+
+The supported file types are:
+
+ * `.m`: a Matpower file
+ * `.raw`: a PTI (PSS(R)E-v33)
+ * `.json`: a PowerModels.jl JSON file
+
+All fields from PTI files will be imported if `import_all` is true.
+
+If `validate = true`, PowerModels will validate the imported data for correctness.
 """
-
-
-"Parses the iostream from a file"
 function parse_file(io::Union{IO,String}; import_all=false, validate=true, filetype="json")
     if io isa String
-        filetype = split(lowercase(io), '.')[end]
+        filetype=lowercase(last(split(io, '.')))
     end
-
     if filetype == "m"
-        pm_data = PowerModels.parse_matpower(io, validate=validate)
+        return PowerModels.parse_matpower(io; validate)
     elseif filetype == "raw"
-        pm_data = PowerModels.parse_psse(io; import_all=import_all, validate=validate)
+        return PowerModels.parse_psse(io; import_all, validate)
     elseif filetype == "json"
-        pm_data = PowerModels.parse_json(io; validate=validate)
+        return PowerModels.parse_json(io; validate)
     else
         Memento.error(_LOGGER, "Unrecognized filetype: \".$filetype\", Supported extensions are \".raw\", \".m\" and \".json\"")
     end
-
-    return pm_data
 end
 
 
@@ -61,10 +64,10 @@ end
 Export a PowerModels data structure to the file according of the extension:
     - `.m` : Matpower
     - `.raw` : PTI (PSS(R)E-v33)
-    - `.json` : JSON 
+    - `.json` : JSON
 """
 function export_file(file::AbstractString, data::Dict{String, Any})
-    if occursin(".", file) 
+    if occursin(".", file)
         open(file, "w") do io
             export_file(io, data, filetype=split(lowercase(file), '.')[end])
         end
