@@ -187,7 +187,7 @@ function instantiate_pf_data(data::Dict{String,<:Any})
             elseif gen_bus["bus_type"] == 2
                 q_delta[gen_bus["index"]] -= gen["qg"]
             else
-                @assert false
+                #@assert false   # not desired if PQ busses should be allowed to have generators.
             end
         end
     end
@@ -334,13 +334,8 @@ function compute_ac_pf(pf_data::PowerFlowData, limiting_generators=Dict{Int, Int
             bus = bus_assignment["$(bid)"]
 
             if bus_type_idx[i] == 1
-                #@assert !haskey(bus_gens, bid)
                 bus["vm"] = pf_result.zero[2*i - 1]
                 bus["va"] = pf_result.zero[2*i]
-                if haskey(bus_gens, bid)
-                    println("fixme :)")
-                end
-
             elseif bus_type_idx[i] == 2
                 for gen in bus_gens[bid]
                     sol_gen = gen_assignment["$(gen["index"])"]
@@ -435,7 +430,7 @@ function compute_ac_pf!(pf_data::PowerFlowData; kwargs...)
         bus["va"] = pf_data.va_idx[i]
 
         if bus_type_idx[i] == 1
-            @assert !haskey(bus_gens, bid)
+            # @assert !haskey(bus_gens, bid) # not necessary. PQ busses should be allowed to have generators.
             #update covered by default update
 
         elseif bus_type_idx[i] == 2
@@ -524,14 +519,19 @@ function _assign_qg!(sol_gens::Dict{String,<:Any}, bus_gens::Vector, qg_remainin
 end
 
 
-function compute_ac_pf_limit_iteration(pf_data::PowerFlowData; kwargs...)
+function compute_ac_pf_q_limit_iteration(data; kwargs...)
+    data = deepcopy(data)
     # setup list of generators at their Q limits
-    limiting_generators = Dict{Int, Int}()
-    for (i, gen) in pf_data.data["gen"]
+    limiting_generators = Dict{Int, Int}()    # gen_id, limitation: -1, 0, 1 (qmin lim, not limited, qmax lim)
+    for (i, gen) in data["gen"]
         limiting_generators[parse(Int, i)] = 0
+        # vg is used as the generator voltage setpoint. vm is used by the power flow
+        # They need to be identical for this implementation
+        @assert data["bus"][string(gen["gen_bus"])]["vm"] == gen["vg"]
     end
-    # TODO assert that ["gen"]["vg"] == ["bus"]["vm"]
-    # assert only one generator per bus!!
+
+
+
     iteration_count = 0
     while iteration_count < 10
         iteration_count += 1
@@ -539,11 +539,34 @@ function compute_ac_pf_limit_iteration(pf_data::PowerFlowData; kwargs...)
         # debugging
         #pf_result = _compute_ac_pf(pf_data; kwargs...)
         #return pf_result
-        res = compute_ac_pf(pf_data, limiting_generators; kwargs...)
+        
+        pf_data = instantiate_pf_data(data)
+        for (bus, bus_gens) in pf_data.bus_gens
+            # assert only one generator per bus for now.
+            @assert length(bus_gens) <=1
+        end
+        res = compute_ac_pf(pf_data; kwargs...)
+
         solution = res["solution"]
+        if !res["termination_status"]
+            println("Failed!")
+            return
+        end
         # check if q within qlims
         q_violations = find_q_violations(pf_data, solution)
-        @show q_violations
+        #@show q_violations
+        # largest_q_violation:
+        size = 0
+        violation= nothing
+        for (bus, viol) in q_violations
+            if abs(viol["q_viol"]) >size
+                size = abs(viol["q_viol"])
+                violation = (bus, viol)
+            end
+        end
+        #@show violation
+
+
         if length(q_violations) == 0
             println("Iteration counter exterior loop: $iteration_count")
             return res
@@ -561,35 +584,39 @@ function compute_ac_pf_limit_iteration(pf_data::PowerFlowData; kwargs...)
             limiting_generators[gen_id] = violation["violation_type"]
             new_q = violation["q_new"]
             
-            @assert pf_data.bus_type_idx[idx] == 2
-            pf_data.bus_type_idx[idx] = 1 # make a pv bus a pq bus
-            println("Changed bus at idx $idx")
-            #gen["gen_status"] = 0  # breaks it later
-            pf_data.q_delta_base_idx[idx] = -new_q # the minus is a guess for now
-            pf_data.q_inject_idx[idx] = 0.0 
-            println("Clamped: $violation")
+            @assert data["bus"][string(bus_id)]["bus_type"] == 2
+            data["bus"][string(bus_id)]["bus_type"] = 1 # make a pv bus a pq bus
+
+            # set qg to the determined setpoint
+            data["gen"][string(gen_id)]["qg"] = new_q
+            #println("Clamped: $violation")
         end
-        #pf_result = _compute_ac_pf(pf_data; kwargs...)
-        #return pf_result
+
+        pf_data = instantiate_pf_data(data)
         res = compute_ac_pf(pf_data, limiting_generators; kwargs...)
+
         solution = res["solution"]
+        if !res["termination_status"]
+            println("Failed!")
+            return
+        end
 
         # release overtightened generators
         incorrectly_limited = find_incorrectly_limiting_generators(solution, pf_data, limiting_generators)
-        @show incorrectly_limited
+        #@show incorrectly_limited
         if length(incorrectly_limited) == 0
             return res
+        else
+            println("Some incorrect limitations: $(length(incorrectly_limited))")
         end
 
         for gen_id_int in incorrectly_limited
             limiting_generators[gen_id_int] = 0
 
             bus_id = pf_data.data["gen"][string(gen_id)]["gen_bus"]
-            idx = pf_data.am.bus_to_idx[bus_id]
 
-            @assert pf_data.bus_type_idx[idx] == 2
-            pf_data.bus_type_idx[idx] == 1 # make a pv bus a pq bus
-            pf_data.q_delta_base_idx[idx] = 0 
+            @assert data["bus"][string(bus_id)]["bus_type"] == 1
+            data["bus"][string(bus_id)]["bus_type"] = 2 # make a pq bus a pv bus
 
         end
 
@@ -610,8 +637,6 @@ function find_incorrectly_limiting_generators(solution, pf_data, limiting_genera
         vm_is = solution["bus"][gen_bus]["vm"]
 
         vm_should_be = gen["vg"]
-        @show vm_is
-        @show vm_should_be
         if vm_is > vm_should_be && violation_type == 1  # voltage too high and reactive power at positive limit
             push!(incorrectly_limited, gen_id_int)
         elseif vm_is < vm_should_be && violation_type == -1 # voltage too low and reactive power at negative limit
@@ -636,10 +661,10 @@ function find_q_violations(pf_data, solution)
         qmin = gen["qmin"]
         qg = solution["gen"][gen_id]["qg"]
         gen_id_int = parse(Int, gen_id)
-        if qg > qmax  # will machine precision mess this up?
+        if qg > qmax  && !isapprox(qg, qmax)# will machine precision mess this up?
             @assert bus_type == 2
             violations[gen_id_int] = Dict(["q_viol" =>qg-qmax, "q_new"=>qmax, "violation_type"=>1])
-        elseif  qg < qmin 
+        elseif  qg < qmin && !isapprox(qg, qmin)
             @assert bus_type == 2
             violations[gen_id_int] = Dict(["q_viol" =>qg-qmin , "q_new"=>qmin, "violation_type"=>-1])
         end
@@ -653,14 +678,14 @@ function _compute_ac_pf(pf_data::PowerFlowData; finite_differencing=false, flat_
     bus_type_idx = pf_data.bus_type_idx
     p_delta_base_idx = pf_data.p_delta_base_idx
     q_delta_base_idx = pf_data.q_delta_base_idx
-    p_inject_idx = pf_data.p_inject_idx
-    q_inject_idx = pf_data.q_inject_idx
-    vm_idx = pf_data.vm_idx
-    va_idx = pf_data.va_idx
+    p_inject_idx = pf_data.p_inject_idx  # overwritten for swing bus (seems fine)
+    q_inject_idx = pf_data.q_inject_idx  # overwritten (seems fine)
+    vm_idx = pf_data.vm_idx # overwritten
+    va_idx = pf_data.va_idx # overwritten
     neighbors = pf_data.neighbors
-    x0 = pf_data.x0
-    F0 = pf_data.F0
-    J0 = pf_data.J0
+    x0 = pf_data.x0 # overwritten
+    F0 = pf_data.F0 # overwritten
+    J0 = pf_data.J0 # overwritten
 
     # ac power flow, nodal power balance function eval
     function f!(F::Vector{Float64}, x::Vector{Float64})
