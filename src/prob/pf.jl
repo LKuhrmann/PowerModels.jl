@@ -550,7 +550,7 @@ function compute_ac_pf_q_limit_iteration(data; kwargs...)
         solution = res["solution"]
         if !res["termination_status"]
             println("Failed!")
-            return
+            return res
         end
         # check if q within qlims
         q_violations = find_q_violations(pf_data, solution)
@@ -598,7 +598,7 @@ function compute_ac_pf_q_limit_iteration(data; kwargs...)
         solution = res["solution"]
         if !res["termination_status"]
             println("Failed!")
-            return
+            return res
         end
 
         # release overtightened generators
@@ -613,7 +613,7 @@ function compute_ac_pf_q_limit_iteration(data; kwargs...)
         for gen_id_int in incorrectly_limited
             limiting_generators[gen_id_int] = 0
 
-            bus_id = pf_data.data["gen"][string(gen_id)]["gen_bus"]
+            bus_id = pf_data.data["gen"][string(gen_id_int)]["gen_bus"]
 
             @assert data["bus"][string(bus_id)]["bus_type"] == 1
             data["bus"][string(bus_id)]["bus_type"] = 2 # make a pq bus a pv bus
