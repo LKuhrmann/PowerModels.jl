@@ -1729,7 +1729,7 @@ function _check_voltage_setpoints(data::Dict{String,<:Any})
         bus_id = gen["gen_bus"]
         bus = data["bus"]["$(bus_id)"]
         if gen["vg"] != bus["vm"]
-            Memento.warn(_LOGGER, "the voltage setpoint on generator $(i) does not match the value at bus $(bus_id)")
+            Memento.warn(_LOGGER, "the voltage setpoint on generator $(i) does not match the voltage at bus $(bus_id)")
         end
     end
 

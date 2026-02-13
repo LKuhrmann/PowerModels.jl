@@ -391,6 +391,9 @@ function compute_ac_pf(pf_data::PowerFlowData, limiting_generators=Dict{Int, Int
         "solution" => solution,
         "solve_time" => time() - time_start
     )
+    if :get_final_jacobian_dQdV in keys(kwargs) && kwargs[:get_final_jacobian_dQdV]
+        result["final_dQdV"] = get_jacobian_dQdV_diagonal(pf_data)
+    end
 
     return result
 end
@@ -518,61 +521,111 @@ function _assign_qg!(sol_gens::Dict{String,<:Any}, bus_gens::Vector, qg_remainin
     end
 end
 
+function compute_ac_pf_q_limit_iteration_safer(data; max_iterations=20, ignore_releasing_after_x_iterations=nothing, kwargs...)
+    res = compute_ac_pf_q_limit_iteration(data; max_iterations = max_iterations, ignore_releasing_after_x_iterations=ignore_releasing_after_x_iterations, kwargs...)
 
-function compute_ac_pf_q_limit_iteration(data; kwargs...)
+    if res["termination_status"] || haskey(res,"failed_immediately")
+        return res
+    end
+    new_max_iterations = length(keys(data["gen"])) + 3 # magic bonus iterations
+    res = compute_ac_pf_q_limit_iteration(data; max_iterations=new_max_iterations, limit_qg_individually=true, ignore_releasing_after_x_iterations =new_max_iterations-3, kwargs...)
+    
+    return res
+end
+
+function get_jacobian_dQdV_diagonal(pf_data)
+    J0 = pf_data.J0
+    F = LinearAlgebra.factorize(J0) 
+    n = size(J0,1)
+    d = zeros(eltype(J0), Int(n/2))
+
+    ei = zeros(n)
+    for i in 1:Int(n/2)
+        fill!(ei, 0)
+        ei[2*i] = 1
+        x = F \ ei
+        d[i] = x[2*i-1]
+    end
+    d
+
+    res_dict = Dict()
+    am = pf_data.am
+    for (i, bus_name) in enumerate(am.idx_to_bus)
+
+        bus_type = pf_data.bus_type_idx[i]
+
+        if bus_type == 1 && bus_name <100000
+            if d[i] ≈ 0.0
+                res_dict[bus_name] = Inf
+            else
+                res_dict[bus_name] = 1/d[i]
+            end
+        end
+    end
+    return res_dict
+end
+
+function compute_ac_pf_q_limit_iteration(data; max_iterations=20, limit_qg_individually=false, ignore_releasing_after_x_iterations=nothing, limiting_generators=nothing, get_final_jacobian_dQdV=false, kwargs...)
     data = deepcopy(data)
     # setup list of generators at their Q limits
-    limiting_generators = Dict{Int, Int}()    # gen_id, limitation: -1, 0, 1 (qmin lim, not limited, qmax lim)
+    if isnothing(limiting_generators)
+        limiting_generators = Dict{Int, Int}()    # gen_id, limitation: -1, 0, 1, 2 (qmin lim hit, not limited, qmax lim hit, qmax=qmin)
+    end
+
     for (i, gen) in data["gen"]
+        if haskey(limiting_generators, parse(Int, i))
+            continue
+        end
         limiting_generators[parse(Int, i)] = 0
-        # vg is used as the generator voltage setpoint. vm is used by the power flow
+        if gen["qmax"] == gen["qmin"] && false
+            limiting_generators[parse(Int, i)] = 2
+            gen["qg"] = gen["qmax"]
+            bus_id = gen["gen_bus"]
+
+            if data["bus"][string(bus_id)]["bus_type"] != 3
+                @assert data["bus"][string(bus_id)]["bus_type"] == 2
+                data["bus"][string(bus_id)]["bus_type"] = 1 
+            end
+        end
+        # vg is defined by matpower as the generator voltage setpoint.
+        # vm is used by the power flow solver as the voltage.
         # They need to be identical for this implementation
         @assert data["bus"][string(gen["gen_bus"])]["vm"] == gen["vg"]
     end
 
+    res=nothing
 
-
-    iteration_count = 0
-    while iteration_count < 10
-        iteration_count += 1
-        
-        # debugging
-        #pf_result = _compute_ac_pf(pf_data; kwargs...)
-        #return pf_result
+    for iteration_count in 1:max_iterations
+        passed_q_check = false
+        passed_v_check = false
+        if iteration_count >1
+            println("Iteration: $iteration_count")
+        end
         
         pf_data = instantiate_pf_data(data)
         for (bus, bus_gens) in pf_data.bus_gens
             # assert only one generator per bus for now.
             @assert length(bus_gens) <=1
         end
-        res = compute_ac_pf(pf_data; kwargs...)
-
+        res = compute_ac_pf(pf_data; get_final_jacobian_dQdV=get_final_jacobian_dQdV, kwargs...)
         solution = res["solution"]
         if !res["termination_status"]
             println("Failed!")
-            return res
-        end
-        # check if q within qlims
-        q_violations = find_q_violations(pf_data, solution)
-        #@show q_violations
-        # largest_q_violation:
-        size = 0
-        violation= nothing
-        for (bus, viol) in q_violations
-            if abs(viol["q_viol"]) >size
-                size = abs(viol["q_viol"])
-                violation = (bus, viol)
+            if iteration_count == 1
+                res["failed_immediately"] = true
             end
-        end
-        #@show violation
-
-
-        if length(q_violations) == 0
-            println("Iteration counter exterior loop: $iteration_count")
+            res["limiting_generators"] = limiting_generators
             return res
         end
         
-        # clamp 
+
+        # check if q within qlims
+        q_violations = find_q_violations(pf_data, solution; only_largest_violation=limit_qg_individually)
+        if length(q_violations) == 0
+            passed_q_check = true
+        end
+        
+        # limit qg for generators 
         for (gen_id, violation) in q_violations
             gen = pf_data.data["gen"][string(gen_id)]
             bus_id = gen["gen_bus"]
@@ -582,52 +635,57 @@ function compute_ac_pf_q_limit_iteration(data; kwargs...)
             end
             
             limiting_generators[gen_id] = violation["violation_type"]
-            new_q = violation["q_new"]
-            
+            # make a pv bus a pq bus
             @assert data["bus"][string(bus_id)]["bus_type"] == 2
-            data["bus"][string(bus_id)]["bus_type"] = 1 # make a pv bus a pq bus
+            data["bus"][string(bus_id)]["bus_type"] = 1 
 
             # set qg to the determined setpoint
-            data["gen"][string(gen_id)]["qg"] = new_q
-            #println("Clamped: $violation")
+            data["gen"][string(gen_id)]["qg"] = violation["q_new"]
         end
 
-        pf_data = instantiate_pf_data(data)
-        res = compute_ac_pf(pf_data, limiting_generators; kwargs...)
+        # # release overtightened generators
+        # incorrectly_limited = find_incorrectly_limiting_generators(solution, pf_data, limiting_generators)
+        # if length(incorrectly_limited) == 0 
+        #     passed_v_check = true
+        # elseif !isnothing(ignore_releasing_after_x_iterations) && ignore_releasing_after_x_iterations <= iteration_count
+        #     passed_v_check = true
+        # else
+        #     println("Some incorrect limitations: $(length(incorrectly_limited))")
+        #     @show incorrectly_limited
+        #     @show ignore_releasing_after_x_iterations
+        # end
+        
+        # for gen_id_int in incorrectly_limited
+        #     limiting_generators[gen_id_int] = 0
 
-        solution = res["solution"]
-        if !res["termination_status"]
-            println("Failed!")
+        #     bus_id = pf_data.data["gen"][string(gen_id_int)]["gen_bus"]
+
+        #     @assert data["bus"][string(bus_id)]["bus_type"] == 1
+        #     data["bus"][string(bus_id)]["bus_type"] = 2 # make a pq bus a pv bus
+        # end
+
+        if passed_q_check #&& passed_v_check
+            println("Iteration counter exterior loop: $iteration_count")
+            res["limiting_generators"] = limiting_generators
+        if get_final_jacobian_dQdV
+            res["final_dQdV"] = get_jacobian_dQdV_diagonal(pf_data)
+        end
             return res
         end
-
-        # release overtightened generators
-        incorrectly_limited = find_incorrectly_limiting_generators(solution, pf_data, limiting_generators)
-        #@show incorrectly_limited
-        if length(incorrectly_limited) == 0
-            return res
-        else
-            println("Some incorrect limitations: $(length(incorrectly_limited))")
-        end
-
-        for gen_id_int in incorrectly_limited
-            limiting_generators[gen_id_int] = 0
-
-            bus_id = pf_data.data["gen"][string(gen_id_int)]["gen_bus"]
-
-            @assert data["bus"][string(bus_id)]["bus_type"] == 1
-            data["bus"][string(bus_id)]["bus_type"] = 2 # make a pq bus a pv bus
-
-        end
-
     end
+
+    res["termination_status"] = false
+    
+    res["limiting_generators"] = limiting_generators
+
+    return res
 end
 
 function find_incorrectly_limiting_generators(solution, pf_data, limiting_generators)
     # make sure that generators at their limits have voltages away from their setpoints
     incorrectly_limited = Vector{Int}()
     for (gen_id_int, violation_type) in limiting_generators
-        if violation_type ==0
+        if violation_type ==0 || violation_type == 2
             continue
         end
         gen_id = string(gen_id_int)
@@ -637,16 +695,19 @@ function find_incorrectly_limiting_generators(solution, pf_data, limiting_genera
         vm_is = solution["bus"][gen_bus]["vm"]
 
         vm_should_be = gen["vg"]
-        if vm_is > vm_should_be && violation_type == 1  # voltage too high and reactive power at positive limit
+        if vm_is > vm_should_be && !isapprox(vm_is, vm_should_be) && violation_type == 1 
+            # incorrect: voltage too high and reactive power at positive limit
             push!(incorrectly_limited, gen_id_int)
-        elseif vm_is < vm_should_be && violation_type == -1 # voltage too low and reactive power at negative limit
+            
+        elseif vm_is < vm_should_be && !isapprox(vm_is, vm_should_be) && violation_type == -1 
+            # incorrect: voltage too low and reactive power at negative limit
             push!(incorrectly_limited, gen_id_int)
         end
     end
     return incorrectly_limited
 end 
 
-function find_q_violations(pf_data, solution)
+function find_q_violations(pf_data, solution; only_largest_violation=false)
     violations = Dict{Int, Dict{String, Float64}}()
     for (gen_id, gen) in pf_data.data["gen"]
         # ignore slack bus
@@ -661,31 +722,42 @@ function find_q_violations(pf_data, solution)
         qmin = gen["qmin"]
         qg = solution["gen"][gen_id]["qg"]
         gen_id_int = parse(Int, gen_id)
-        if qg > qmax  && !isapprox(qg, qmax)# will machine precision mess this up?
-            @assert bus_type == 2
+        if qg > qmax#  && !isapprox(qg, qmax)
+            @assert bus_type == 2 # should only happen at PV busses
             violations[gen_id_int] = Dict(["q_viol" =>qg-qmax, "q_new"=>qmax, "violation_type"=>1])
-        elseif  qg < qmin && !isapprox(qg, qmin)
+        elseif  qg < qmin# && !isapprox(qg, qmin)
             @assert bus_type == 2
             violations[gen_id_int] = Dict(["q_viol" =>qg-qmin , "q_new"=>qmin, "violation_type"=>-1])
         end
     end
-    return violations
+    if !only_largest_violation || length(violations) == 0
+        return violations
+    end
+    largest_violation = maximum([abs(v["q_viol"]) for (k,v) in violations])
+    single_violation = Dict{Int, Dict{String, Float64}}()
+    for (k, v) in violations
+        if abs(v["q_viol"]) == largest_violation
+            single_violation[k] = v
+            return single_violation
+        end
+    end
+    @assert false
 end
 
-function _compute_ac_pf(pf_data::PowerFlowData; finite_differencing=false, flat_start=false, kwargs...)
+function _compute_ac_pf(pf_data::PowerFlowData; finite_differencing=false, flat_start=false, get_final_jacobian_dQdV=true, kwargs...)
     data = pf_data.data
     am = pf_data.am
     bus_type_idx = pf_data.bus_type_idx
     p_delta_base_idx = pf_data.p_delta_base_idx
     q_delta_base_idx = pf_data.q_delta_base_idx
-    p_inject_idx = pf_data.p_inject_idx  # overwritten for swing bus (seems fine)
-    q_inject_idx = pf_data.q_inject_idx  # overwritten (seems fine)
-    vm_idx = pf_data.vm_idx # overwritten
-    va_idx = pf_data.va_idx # overwritten
+    p_inject_idx = pf_data.p_inject_idx
+    q_inject_idx = pf_data.q_inject_idx
+    vm_idx = pf_data.vm_idx
+    va_idx = pf_data.va_idx
     neighbors = pf_data.neighbors
-    x0 = pf_data.x0 # overwritten
-    F0 = pf_data.F0 # overwritten
-    J0 = pf_data.J0 # overwritten
+    x0 = pf_data.x0
+    F0 = pf_data.F0
+    J0 = pf_data.J0
 
     # ac power flow, nodal power balance function eval
     function f!(F::Vector{Float64}, x::Vector{Float64})
@@ -864,7 +936,9 @@ function _compute_ac_pf(pf_data::PowerFlowData; finite_differencing=false, flat_
         df = NLsolve.OnceDifferentiable(f!, jsp!, x0, F0, J0)
         result = NLsolve.nlsolve(df, x0; kwargs...)
     end
-
+    if get_final_jacobian_dQdV
+        jsp!(J0, x0)
+    end
     return result
 end
 
