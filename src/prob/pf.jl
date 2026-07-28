@@ -535,7 +535,13 @@ end
 
 function get_jacobian_dQdV_diagonal(pf_data)
     J0 = pf_data.J0
-    F = LinearAlgebra.factorize(J0) 
+    F=nothing
+    try
+        F = LinearAlgebra.factorize(J0) 
+    catch e
+        println("Factorization of power flow data failed")
+        return nothing
+    end
     n = size(J0,1)
     d = zeros(eltype(J0), Int(n/2))
 
@@ -565,7 +571,7 @@ function get_jacobian_dQdV_diagonal(pf_data)
     return res_dict
 end
 
-function compute_ac_pf_q_limit_iteration(data; max_iterations=20, limit_qg_individually=false, ignore_releasing_after_x_iterations=nothing, limiting_generators=nothing, get_final_jacobian_dQdV=false, kwargs...)
+function compute_ac_pf_q_limit_iteration(data; max_iterations=20, limit_qg_individually=false, ignore_releasing_after_x_iterations=nothing, limiting_generators=nothing, get_final_jacobian_dQdV=false, return_after_x_iterations=nothing, kwargs...)
     data = deepcopy(data)
     # setup list of generators at their Q limits
     if isnothing(limiting_generators)
@@ -577,6 +583,7 @@ function compute_ac_pf_q_limit_iteration(data; max_iterations=20, limit_qg_indiv
             continue
         end
         limiting_generators[parse(Int, i)] = 0
+        #=
         if gen["qmax"] == gen["qmin"] && false
             limiting_generators[parse(Int, i)] = 2
             gen["qg"] = gen["qmax"]
@@ -587,6 +594,7 @@ function compute_ac_pf_q_limit_iteration(data; max_iterations=20, limit_qg_indiv
                 data["bus"][string(bus_id)]["bus_type"] = 1 
             end
         end
+        =#
         # vg is defined by matpower as the generator voltage setpoint.
         # vm is used by the power flow solver as the voltage.
         # They need to be identical for this implementation
@@ -664,14 +672,32 @@ function compute_ac_pf_q_limit_iteration(data; max_iterations=20, limit_qg_indiv
         #     data["bus"][string(bus_id)]["bus_type"] = 2 # make a pq bus a pv bus
         # end
 
+        for (gen_name, gen) in data["gen"]
+            gen["pg_start"] = solution["gen"][gen_name]["pg"]
+            gen["qg_start"] = solution["gen"][gen_name]["qg"]
+        end
+
+        for (bus_name, bus) in data["bus"]
+            bus["vm_start"] = solution["bus"][bus_name]["vm"]
+            bus["va_start"] = solution["bus"][bus_name]["va"]
+        end
+
+
+
         if passed_q_check #&& passed_v_check
             println("Iteration counter exterior loop: $iteration_count")
             res["limiting_generators"] = limiting_generators
-        if get_final_jacobian_dQdV
-            res["final_dQdV"] = get_jacobian_dQdV_diagonal(pf_data)
-        end
+            if get_final_jacobian_dQdV
+                res["final_dQdV"] = get_jacobian_dQdV_diagonal(pf_data)
+            end
             return res
         end
+
+        if !isnothing(return_after_x_iterations) && iteration_count >= return_after_x_iterations
+            println("RETURNING AFTER $iteration_count ITERATIONS")
+            return data
+        end
+
     end
 
     res["termination_status"] = false

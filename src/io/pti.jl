@@ -1424,6 +1424,9 @@ function _pm2psse_bus(pm_bus::Dict{String, Any})
     sub_data["NVLO"] = get(pm_bus, "vmin", _default_bus["NVLO"])
 
     _export_remaining!(sub_data, pm_bus, _pti_defaults["BUS"])
+
+    @assert sub_data["EVHI"] >= sub_data["NVHI"] # Either specify "EVHI", or set "NVHI" to 1.1 or less 
+    @assert sub_data["EVLO"] <= sub_data["NVLO"] # Either specify "EVLO", or set "NVLO" to 0.9 or less
     
     return sub_data
 end
@@ -1507,7 +1510,7 @@ function _pm2psse_branch(pm_br::Dict{String, Any}, owner::Int)
     sub_data["CKT"] = "\'$(ckt)\'"
     sub_data["R"] = pm_br["br_r"]
     sub_data["X"] = pm_br["br_x"]
-    sub_data["B"] = 0.0
+    sub_data["B"] = get(pm_br, "b", 0.0)
     sub_data["RATEA"] = get(pm_br, "rate_a", _default_branch["RATEA"])
     sub_data["RATEB"] = get(pm_br, "rate_b", _default_branch["RATEB"])
     sub_data["RATEC"] = get(pm_br, "rate_c", _default_branch["RATEC"])
