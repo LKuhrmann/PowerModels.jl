@@ -187,7 +187,7 @@ function instantiate_pf_data(data::Dict{String,<:Any})
             elseif gen_bus["bus_type"] == 2
                 q_delta[gen_bus["index"]] -= gen["qg"]
             else
-                @assert false
+                # @assert false
             end
         end
     end
@@ -524,6 +524,150 @@ function _assign_qg!(sol_gens::Dict{String,<:Any}, bus_gens::Vector, qg_remainin
     end
 end
 
+function get_jacobian_dQdV_diagonal(pf_data)
+    J0 = pf_data.J0
+    F=nothing
+    try
+        F = LinearAlgebra.factorize(J0) 
+    catch e
+        println("Factorization of power flow data failed")
+        return nothing
+    end
+    n = size(J0,1)
+    d = zeros(eltype(J0), Int(n/2))
+
+    ei = zeros(n)
+    for i in 1:Int(n/2)
+        fill!(ei, 0)
+        ei[2*i] = 1
+        x = F \ ei
+        d[i] = x[2*i-1]
+    end
+    d
+
+    res_dict = Dict()
+    am = pf_data.am
+    for (i, bus_name) in enumerate(am.idx_to_bus)
+
+        bus_type = pf_data.bus_type_idx[i]
+
+        if bus_type == 1 && bus_name <100000
+            if d[i] ≈ 0.0
+                res_dict[bus_name] = Inf
+            else
+                res_dict[bus_name] = 1/d[i]
+            end
+        end
+    end
+    return res_dict
+end
+
+function compute_ac_pf_q_limit_iteration(data; max_iterations=20, limit_qg_individually=false, kwargs...)
+    data = deepcopy(data)
+
+    # setup list of generators at their Q limits
+    limiting_generators =  Dict{Int, Int}()    # gen_id, limitation: -1, 0, 1 (qmin lim hit, not limited, qmax lim hit)
+    for (i, gen) in data["gen"]
+        limiting_generators[parse(Int, i)] = 0
+
+        # vg is defined by matpower as the generator voltage setpoint.
+        # vm is used by the power flow solver as the voltage.
+        # They need to be identical for this implementation
+        @assert data["bus"][string(gen["gen_bus"])]["vm"] == gen["vg"]
+    end
+
+    res=nothing
+
+    for iteration_count in 1:max_iterations
+        
+        pf_data = instantiate_pf_data(data)
+        for (bus, bus_gens) in pf_data.bus_gens
+            # assert only one generator per bus for now.
+            @assert length(bus_gens) <=1
+        end
+
+        res = compute_ac_pf(pf_data; kwargs...)
+        res["limiting_generators"] = limiting_generators
+
+        if !res["termination_status"]
+            return res
+        end
+        solution = res["solution"]
+        
+        # check if q within qlims
+        q_violations = find_q_violations(pf_data, solution; only_largest_violation=limit_qg_individually)
+        
+        # limit qg for generators 
+        for (gen_id, violation) in q_violations
+            gen = pf_data.data["gen"][string(gen_id)]
+            bus_id = gen["gen_bus"]
+            idx = pf_data.am.bus_to_idx[bus_id]
+            if pf_data.bus_type_idx[idx] == 3
+                continue
+            end
+            
+            limiting_generators[gen_id] = violation.violation_type
+            # make a pv bus a pq bus
+            @assert data["bus"][string(bus_id)]["bus_type"] == 2
+            data["bus"][string(bus_id)]["bus_type"] = 1 
+
+            # set qg to the determined setpoint
+            data["gen"][string(gen_id)]["qg"] = violation.q_new
+        end
+
+        # if no q limit violations remain, return
+        if length(q_violations) == 0 
+            return res
+        end
+
+        # warmstart next round
+        for (gen_name, gen) in data["gen"]
+            gen["pg_start"] = solution["gen"][gen_name]["pg"]
+            gen["qg_start"] = solution["gen"][gen_name]["qg"]
+        end
+
+        for (bus_name, bus) in data["bus"]
+            bus["vm_start"] = solution["bus"][bus_name]["vm"]
+            bus["va_start"] = solution["bus"][bus_name]["va"]
+        end
+    end
+
+    res["termination_status"] = false
+    
+    return res
+end
+
+function find_q_violations(pf_data, solution; only_largest_violation=false)
+    violations = Dict{Int, NamedTuple}()
+    for (gen_id, gen) in pf_data.data["gen"]
+        gen_bus = pf_data.data["gen"][gen_id]["gen_bus"]
+        idx = pf_data.am.bus_to_idx[gen_bus]
+        bus_type = pf_data.bus_type_idx[idx]
+    
+        # ignore slack bus
+        if bus_type == 3
+            continue
+        end
+        
+        qmax = gen["qmax"]
+        qmin = gen["qmin"]
+        qg = solution["gen"][gen_id]["qg"]
+        gen_id_int = parse(Int, gen_id)
+        if qg > qmax#  && !isapprox(qg, qmax)
+            @assert bus_type == 2 # should only happen at PV busses
+            violations[gen_id_int] = (;q_viol=qg-qmax, q_new=qmax, violation_type=1)
+        elseif  qg < qmin# && !isapprox(qg, qmin)
+            @assert bus_type == 2
+            violations[gen_id_int] = (;q_viol=qg-qmin, q_new=qmin, violation_type=-1)
+        end
+    end
+    if !only_largest_violation || length(violations) == 0
+        return violations
+    end
+    # only largest violation
+    idx = argmax([abs(v.q_viol) for (k,v) in violations])
+    return Dict([keys(violations)[idx] => values(violations)[idx]])
+end
 
 function _compute_ac_pf(pf_data::PowerFlowData; finite_differencing=false, flat_start=false, kwargs...)
     data = pf_data.data
