@@ -351,7 +351,7 @@ function compute_ac_pf(pf_data::PowerFlowData; kwargs...)
             J_idx = am.idx_to_J_idx[i]
 
             if bus_type_idx[i] == 1
-                @assert !haskey(bus_gens, bid)
+                # @assert !haskey(bus_gens, bid) # not necessary. PQ busses should be allowed to have generators.
                 bus["vm"] = pf_result.zero[J_idx]
                 bus["va"] = pf_result.zero[J_idx + 1]
 
